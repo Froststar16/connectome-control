@@ -1,10 +1,13 @@
-"""Download FlyWire v783 connectivity data from Zenodo and verify checksums.
+"""Download FlyWire v783 data and verify checksums.
 
-Source: FlyWire Consortium, "FlyWire Whole-brain Connectome Connectivity Data",
-Zenodo, doi:10.5281/zenodo.10676866 (CC-BY 4.0).
+Sources (both CC-BY 4.0):
+  * Connectivity: FlyWire Consortium, Zenodo record 10676866 (doi:10.5281/zenodo.10676866).
+  * Neuron annotations: flyconnectome/flywire_annotations on GitHub, release v3.2.0
+    (Schlegel et al. 2024, Dorkenwald et al. 2024, Berg et al. 2026, Tastekin et al. 2026,
+    Matsliah et al. 2024). Pinned to a release tag so the file never changes under us.
 
 Usage:
-    python scripts/download_data.py              # downloads into data/raw/
+    python scripts/download_data.py              # downloads everything into data/raw/
     python scripts/download_data.py --data-dir /some/other/path
 """
 
@@ -18,13 +21,28 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 
-ZENODO_RECORD = "10676866"
-BASE_URL = f"https://zenodo.org/records/{ZENODO_RECORD}/files"
+ZENODO = "https://zenodo.org/records/10676866/files"
+ANNOTATIONS_TAG = "v3.2.0"
+GITHUB_RAW = (
+    "https://raw.githubusercontent.com/flyconnectome/flywire_annotations/"
+    f"{ANNOTATIONS_TAG}/supplemental_files"
+)
 
-# filename -> expected MD5 (from the Zenodo record page)
+# local filename -> (download URL, expected MD5).
+# Zenodo MD5s come from the record page; the annotation MD5 was computed from the v3.2.0 tag.
 FILES = {
-    "proofread_root_ids_783.npy": "e0e6c19732fd8c7a4e39a2d170105421",
-    "proofread_connections_783.feather": "f48f972d262323a102aed49af1396b8a",
+    "proofread_root_ids_783.npy": (
+        f"{ZENODO}/proofread_root_ids_783.npy?download=1",
+        "e0e6c19732fd8c7a4e39a2d170105421",
+    ),
+    "proofread_connections_783.feather": (
+        f"{ZENODO}/proofread_connections_783.feather?download=1",
+        "f48f972d262323a102aed49af1396b8a",
+    ),
+    f"neuron_annotations_{ANNOTATIONS_TAG}.tsv": (
+        f"{GITHUB_RAW}/Supplemental_file1_neuron_annotations.tsv",
+        "fd4fcb205256ca2f80a2eca3a0cc5d87",
+    ),
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +73,7 @@ def download(url: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def fetch(name: str, expected_md5: str, data_dir: Path) -> None:
+def fetch(name: str, url: str, expected_md5: str, data_dir: Path) -> None:
     dest = data_dir / name
     if dest.exists():
         if md5sum(dest) == expected_md5:
@@ -63,7 +81,7 @@ def fetch(name: str, expected_md5: str, data_dir: Path) -> None:
             return
         print(f"[redo] {name} exists but checksum mismatch, re-downloading")
 
-    download(f"{BASE_URL}/{name}?download=1", dest)
+    download(url, dest)
 
     actual = md5sum(dest)
     if actual != expected_md5:
@@ -81,8 +99,8 @@ def main() -> None:
     args = parser.parse_args()
     args.data_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, md5 in FILES.items():
-        fetch(name, md5, args.data_dir)
+    for name, (url, md5) in FILES.items():
+        fetch(name, url, md5, args.data_dir)
     print(f"\nAll files ready in {args.data_dir}")
 
 

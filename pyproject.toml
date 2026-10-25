@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "connectome-control"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turning the fruit fly connectome into a robot controller: graph analysis, spiking simulation, and closed-loop control in MuJoCo."
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,7 +17,7 @@ dependencies = [
     "scipy>=1.11",
     "requests>=2.31",
     "tqdm>=4.66",
-    "matplotlib>=3.8",
+    "matplotlib>=3.10",
 ]
 
 [project.optional-dependencies]
