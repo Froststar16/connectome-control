@@ -3,10 +3,6 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-   data/
-   *.feather
-   *.npy
-   .venv/
 
 # C extensions
 *.so
@@ -224,7 +220,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# project data (added cleanly)
+# project data (leading slash = only the top-level data/ folder, NOT src/c2c/data/)
 /data/
 *.feather
 *.npy
