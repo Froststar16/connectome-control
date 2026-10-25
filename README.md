@@ -23,6 +23,17 @@ assigned to the neuropil where it receives the most input; hemispheres merged.*
 The connectome is stored as a SciPy CSR matrix with `W[i, j]` = signed input from neuron *j* to
 neuron *i* (ACH +1, GABA −1, GLUT −1, modulatory 0), so the input to every neuron is `W @ r`.
 
+## Takeaways
+
+- **Hubs are real.** The average neuron has ~20 strong input partners, but the most
+  connected one has 5,080 inputs, and one neuron sends output to 6,399 others.
+  Both degree distributions have heavy, roughly power-law tails.
+- **Wiring is mostly local.** 57.9% of synapses connect neurons homed in the same region.
+- **Regions differ sharply in E/I balance.** The mushroom body lobes are ~75–83% excitatory
+  (its Kenyon cells are cholinergic), while the ellipsoid body (the fly's heading
+  compass) is ~69% inhibitory, as are SAD and AMMC (antennal mechanosensory areas).
+  The antennal lobe stands out with ~21% modulatory input.
+
 ## Quick start
 
 ```powershell
