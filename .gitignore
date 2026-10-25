@@ -225,7 +225,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # project data (added cleanly)
-data/
+/data/
 *.feather
 *.npy
 *.part
