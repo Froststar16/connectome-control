@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "connectome-control"
-version = "0.2.0"
+version = "0.3.0"
 description = "Turning the fruit fly connectome into a robot controller: graph analysis, spiking simulation, and closed-loop control in MuJoCo."
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sim = [
+    "brian2>=2.7",
+    "torch>=2.2",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

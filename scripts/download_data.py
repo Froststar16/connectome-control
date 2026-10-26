@@ -6,8 +6,12 @@ Sources (both CC-BY 4.0):
     (Schlegel et al. 2024, Dorkenwald et al. 2024, Berg et al. 2026, Tastekin et al. 2026,
     Matsliah et al. 2024). Pinned to a release tag so the file never changes under us.
 
+  * Optional (--shiu, Phase 3): the connectivity table of Shiu et al. 2024 (Nature), from their
+    repository github.com/philshiu/Drosophila_brain_model, pinned to a commit (~100 MB).
+
 Usage:
     python scripts/download_data.py              # downloads everything into data/raw/
+    python scripts/download_data.py --shiu       # ...plus the Shiu et al. table for Phase 3
     python scripts/download_data.py --data-dir /some/other/path
 """
 
@@ -42,6 +46,18 @@ FILES = {
     f"neuron_annotations_{ANNOTATIONS_TAG}.tsv": (
         f"{GITHUB_RAW}/Supplemental_file1_neuron_annotations.tsv",
         "fd4fcb205256ca2f80a2eca3a0cc5d87",
+    ),
+}
+
+# Shiu et al. (2024) model inputs, pinned to commit 91bdd1e of philshiu/Drosophila_brain_model.
+SHIU_COMMIT = "91bdd1e7dcf193f3e7ca5a8933497fcef63b7960"
+SHIU_FILES = {
+    "shiu2024_connectivity_783.parquet": (
+        (
+            "https://raw.githubusercontent.com/philshiu/Drosophila_brain_model/"
+            f"{SHIU_COMMIT}/Connectivity_783.parquet"
+        ),
+        "3d802fd542b5d18570ba1ba0bb0abed9",
     ),
 }
 
@@ -96,10 +112,15 @@ def main() -> None:
         "--data-dir", type=Path, default=REPO_ROOT / "data" / "raw",
         help="where to save files (default: data/raw/)",
     )
+    parser.add_argument(
+        "--shiu", action="store_true",
+        help="also download the Shiu et al. 2024 connectivity table (Phase 3 comparison)",
+    )
     args = parser.parse_args()
     args.data_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, (url, md5) in FILES.items():
+    files = FILES | (SHIU_FILES if args.shiu else {})
+    for name, (url, md5) in files.items():
         fetch(name, url, md5, args.data_dir)
     print(f"\nAll files ready in {args.data_dir}")
 
