@@ -31,7 +31,7 @@ from c2c.data.loaders import POST, PRE
 from c2c.sim.brian_lif import simulate_brian
 from c2c.sim.network import silence_columns, subnetwork, weight_matrix
 from c2c.sim.params import SHIU2024 as P
-from c2c.sim.torch_lif import simulate_torch
+from c2c.sim.torch_lif import LIFStepper, simulate_torch
 
 D, R = P.delay_steps, P.refractory_steps
 THETA = P.v_th - P.v_0
@@ -248,6 +248,64 @@ def test_per_trial_rates_make_a_sweep_in_one_batch():
                          device="cpu", seed=1)
     m = res.rates()[0].reshape(3, 20).mean(axis=1)
     assert m[0] == 0 and 30 < m[1] < 70 and 170 < m[2] < 230
+
+
+# ---- stepping (Phase 4) ------------------------------------------------------------------
+def same_run(a, b):
+    """True if two SimResults contain exactly the same spikes, first-spike times and voltages."""
+    ra = sorted(zip(a.raster["trial"], a.raster["neuron"], np.round(a.raster["t"], 6), strict=True))
+    rb = sorted(zip(b.raster["trial"], b.raster["neuron"], np.round(b.raster["t"], 6), strict=True))
+    return (np.array_equal(a.counts, b.counts) and ra == rb
+            and np.array_equal(a.first_spike, b.first_spike, equal_nan=True)
+            and np.array_equal(a.v_trace, b.v_trace) and a.t_run == b.t_run)
+
+
+@pytest.mark.parametrize("mode", ["event", "spmm"])
+def test_stepped_run_equals_one_shot_run(mode):
+    """Cutting a run into many step() calls must not change a single spike or voltage: same
+    operations, same random numbers, same order. Chunk sizes straddle the delay (18 steps) and
+    refractory (22 steps) ring buffers, whose positions depend on the global step count."""
+    W = random_network(seed=3)
+    kw = {"drive": np.arange(6), "rate_hz": 120.0, "n_trials": 5, "seed": 9,
+          "forced": ([20, 21], [3.0, 40.0]), "i_bias": np.r_[np.zeros(50), np.full(10, 8.0)],
+          "record_v": [10, 30], "mode": mode, "device": "cpu", "dtype": torch.float64}
+    one = simulate_torch(W, P, t_run=200.0, **kw)
+    assert one.counts.sum() > 500
+    stepper = LIFStepper(W, P, **kw)
+    chunks = [1, 17, 18, 19, 21, 22, 23, 100, 779, 1000]
+    assert sum(chunks) == 2000
+    for c in chunks:
+        stepper.step(c)
+    assert same_run(one, stepper.result())
+
+
+def test_step_returns_the_spikes_of_that_window():
+    W = random_network(seed=5)
+    watch = [3, 0, 41]
+    st = LIFStepper(W, P, drive=np.arange(6), rate_hz=150.0, n_trials=4, seed=2, watch=watch,
+                    device="cpu", dtype=torch.float64)
+    windows = [st.step(10) for _ in range(30)]
+    assert windows[0].shape == (3, 4)
+    assert np.array_equal(np.sum(windows, axis=0), st.result().counts[watch])
+
+
+def test_rates_can_change_between_steps():
+    """The point of stepping: input decided while the run is going. A Poisson-driven neuron
+    follows its rate window by window (and fires at exactly 0 Hz when the rate is 0)."""
+    st = LIFStepper(sparse.csr_matrix((1, 1)), P, drive=[0], n_trials=200, seed=4, device="cpu")
+    off = st.step(1000, rate_hz=0.0)
+    on = st.step(1000, rate_hz=np.full((1, 200), 80.0))    # (n_drive, n_trials) form
+    assert off.sum() == 0
+    assert on.mean() == pytest.approx(8.0, abs=0.6)        # 80 Hz x 100 ms
+
+
+def test_reset_state_starts_over():
+    W = random_network(seed=6)
+    st = LIFStepper(W, P, drive=np.arange(6), rate_hz=150.0, seed=1, device="cpu")
+    st.step(500)
+    st.reset_state()
+    assert st.k == 0 and st.result().counts.sum() == 0
+    assert torch.all(st.v == P.v_0) and torch.all(st.g == 0)
 
 
 # ---- weight matrix helpers ---------------------------------------------------------------

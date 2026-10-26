@@ -5,9 +5,9 @@ wired in. This project reads that wiring from the FlyWire whole-brain connectome
 and asks a robotics question: **if you know which neural pathway produces which action, can you
 use the brain's own wiring as a controller?**
 
-**Status:** Phase 3 complete (`v0.3-spiking`): the wiring now runs as a whole-brain spiking
-simulation. Looming input really does fire the escape neurons, and the fastest one is not the
-famous giant fiber.
+**Status:** Phase 4 complete (`v0.4-control`): the spiking brain now drives a simulated fly body.
+It sees a ball coming, is told to back up about 10 ms after its looming detectors first fire, and
+then holds its distance from the ball, a behaviour nobody programmed.
 
 ## The 30-second version
 
@@ -22,6 +22,9 @@ famous giant fiber.
   published whole-brain model, wrote a batched PyTorch simulator that matches it spike for spike,
   and showed which escape neurons fire first when something looms, which pathways they need, and
   how one modelling choice can switch the giant fiber off.
+- Then I gave it a body: NeuroMechFly in MuJoCo, with compound eyes feeding the looming detectors
+  and the escape neurons steering the legs, all in one 0.1 ms lockstep loop. Cut one input pathway
+  and the escape comes 60 ms late; cut the other and the giant fiber loses 81% of its spikes.
 
 ![The looming-escape circuit](results/figures/looming_escape_circuit.png)
 
@@ -43,7 +46,8 @@ flowchart LR
     B --> C[Signed CSR matrix<br/>W = sign × counts]
     C --> D[Pathways<br/>BFS · Dijkstra · flow layers]
     D --> E[Phase 3<br/>spiking simulation<br/>Brian2 reference + PyTorch]
-    E --> F[Phase 4<br/>descending neurons → MuJoCo body]
+    E --> F[Phase 4<br/>eyes → brain → descending neurons<br/>→ MuJoCo body, closed loop]
+    F -->|the fly moves, its eyes see something new| F
 ```
 
 ## What I found
@@ -120,6 +124,69 @@ For a controller, that is the difference between a wiring diagram and a model: y
 happens if I cut this?" and get an answer in seconds, including answers the wiring diagram gets
 backwards.
 
+## Closing the loop (Phase 4)
+
+A brain in a jar only answers "what fires?". With a body you can ask "what happens next?", because
+whatever the fly does changes what it sees. So the brain from Phase 3 now runs inside a loop:
+
+```
+compound eyes (2 × 721 ommatidia) → looming detector → LPLC2 / LC4 → 134k spiking neurons
+      ↑                                                                        ↓
+NeuroMechFly body (MuJoCo) ← walking controller ← decoder ← escape descending neurons
+```
+
+![Closed-loop escape](results/figures/phase4_escape_shiu_min5.gif)
+
+*A 2 mm ball flies at the fly's head at 150 mm/s and stops 8 mm short. Top line: time, mean escape
+DN rate, and the walking command (positive = forward, negative = backward). Played at 1/10 speed.*
+
+Three pieces turn the simulator into a controller:
+
+- **Encoder.** From the dark area on each eye: angular size (5.5° per ommatidium, within 6% of the
+  geometry between 11° and 40°) and its expansion speed. LC4 gets Poisson input in proportion to
+  speed, LPLC2 to size while the ball grows, which is what each cell type reports in recordings.
+- **The brain as a stepper.** Phase 3's simulator, refactored to keep its state between calls.
+  Stepping it 1 ms at a time gives bit for bit the same spikes as one long run (tested), so it can
+  advance in lockstep with the physics: both use a 0.1 ms timestep.
+- **Decoder.** Escape DN spikes → rates → a weighted average of three motor programs: walk, back up
+  (DNp02 + DNp04, which make flies jump backward when activated) and run forward (DNp11). One
+  free number. The giant fiber triggers takeoff, which a walking-only body can't do, so it is logged.
+
+![Closed vs open loop](results/figures/phase4_closed_loop_shiu_min5.png)
+
+*Grey: brain disconnected, the fly walks under the ball. Blue: the looming input recorded from a
+standing fly, replayed into the brain. Red: the brain sees through its own eyes.*
+
+| 3 seeds each | Backward command after first input | Closest gap to ball | Gap after the ball stops | Giant fiber spikes |
+|---|---|---|---|---|
+| No brain | never | 1.3 mm (walks under it) | – | – |
+| Open loop (replayed input) | 13–14 ms | 0.7–1.4 mm | 1.3–1.9 mm | 22–24 |
+| **Closed loop** | **8–15 ms** | **2.8–3.0 mm** | **3.0–3.3 mm** | 74–83 |
+| Closed, LC4 silenced | 53–88 ms | 1.8–1.9 mm | 1.9–2.1 mm | 72–76 |
+| Closed, LPLC2 silenced | 8–15 ms | 1.9–2.3 mm | 2.4–2.5 mm | 10–17 |
+
+**The reflex is the same, open or closed: what happens after it is not.** Replayed input backs the
+fly up, then goes quiet when the ball stops, and the fly walks on under it. In closed loop, every
+step forward makes the ball grow on its retina again, DNp04 fires, and the command dips below zero.
+The fly hovers about 3 mm from the ball for the last half second. Nothing in the code says "keep
+your distance": the gap is a set point of a feedback loop, where backward drive from the brain
+balances the tonic walking drive.
+
+**Silencing in a loop separates jobs that fixed input blurs.** Before running it I predicted, from
+Phase 3's rates pushed through the decoder, that neither silencing would change the escape. Wrong
+twice. Without LC4 the escape starts about 60 ms late: at the start of a real approach the ball is
+small but already expanding fast, so LC4 (speed) is the only channel with anything to say. Without
+LPLC2 the onset is unchanged, but the giant fiber loses 81% of its spikes, which is the 2019
+finding that LPLC2 is necessary for giant-fiber escape, recovered from wiring alone. Both shrink
+the standoff: less gain from looming to backing up, so the set point moves closer.
+
+**Which connectome?** Phase 3 left a question: on my graph the giant fiber barely fires, on Shiu
+et al.'s it fires second. A one-change-at-a-time chain of graph variants answers it: keeping my
+≥5-synapse edges but giving each neuron one sign (`shiu_min5`) makes it fire like the full graph
+(142–169 Hz vs 153–172 Hz at 100 Hz input). The synapse threshold is harmless here; the sign rule
+decides. Phase 4 runs on `shiu_min5`: it matches recordings (LC4 and LPLC2 excite the giant
+fiber), respects Dale's principle, and is 5.6× smaller than the full graph.
+
 <details>
 <summary><b>Things that surprised me</b></summary>
 
@@ -151,6 +218,20 @@ backwards.
 - **Phase 3:** the paper's "right-side" sugar neurons are labelled left in the current annotations,
   while 20 of their 21 IDs survived unchanged from FlyWire release 630 to 783. Match neurons by ID, never
   by side label.
+- **Phase 4:** the fly simulator I planned around was rewritten from scratch in March 2026. flygym
+  2.x shares a name with 1.x and almost nothing else, so every tutorial I had bookmarked was wrong.
+  I read the new source before writing a line.
+- **Phase 4:** a ball straight ahead sits on the seam between the two eyes. While the fly walks,
+  its head sways and the ball hops from one eye to the other, so each eye alone sees it blink in and
+  out. Taking the larger of the two eyes' estimates fixed it.
+- **Phase 4:** rendering 1,442 ommatidia takes about 80% of the wall-clock time; the 134k-neuron
+  brain takes about 5%. And in the latency budget the filters (15 ms encoder, 20 ms decoder, 50 ms
+  gait oscillators) dwarf the 5–10 ms of neural processing. The slow parts are the engineering.
+- **Phase 4:** I wrote down what silencing LC4 and LPLC2 would do before running it, and got both
+  wrong. A steady-input table can't show that one channel is the early warning; you need a ball
+  that actually approaches.
+- **Phase 4:** the hovering came as a surprise. I gave the ball a stop so the runs would end
+  cleanly, and the closed-loop fly turned the stop into a standoff.
 
 </details>
 
@@ -210,6 +291,29 @@ where the strongest path is deliberately longer than the shortest.
 </details>
 
 <details>
+<summary><b>How the closed loop works</b></summary>
+
+- **Body.** NeuroMechFly v2 through flygym 2.1 (MuJoCo): legs-only fly, 42 position-controlled leg
+  joints, adhesion pads, two compound eyes of 721 ommatidia. Its walking controller (a CPG in a
+  tripod gait plus two leg reflexes) takes a two-number "descending signal", left and right:
+  magnitude = stepping amplitude, sign = direction.
+- **Encoder.** Dark area on each eye → angular size (5.5° per ommatidium, calibrated against
+  geometry) → expansion speed. LC4 gets a Poisson rate proportional to speed, LPLC2 proportional to
+  size while the object expands, matching what each cell type encodes in recordings.
+- **Brain.** The Phase 3 simulator, refactored into a stepper that keeps its state between calls.
+  Stepping it 1,000 times for 1 ms gives bit-for-bit the same spikes as one 1-second run (tested).
+- **Decoder.** Escape DN spike counts → rates (20 ms filter) → a weighted average of three motor
+  programs: walk (weight 1), back up (DNp02 + DNp04), run forward (DNp11), each escape weighted by
+  its rate / 40 Hz. The giant fiber is read out as a takeoff trigger but the body can't fly.
+- **Lockstep.** Brain dt and physics timestep are both 0.1 ms. Every 1 ms tick: render eyes (every
+  2 ms), step the brain 10 steps, decode, step the body 10 steps with the *previous* tick's command,
+  so the loop stays causal.
+- **Tests.** Stepped = one-shot brain (bit for bit), encoder vs geometry on the real eyes, decoder
+  limits, loop causality (break it and the test fails). 20 new tests, 85 in total.
+
+</details>
+
+<details>
 <summary><b>Where else this applies</b></summary>
 
 The tools here are about directed, weighted, signed graphs, not flies specifically.
@@ -223,6 +327,9 @@ The tools here are about directed, weighted, signed graphs, not flies specifical
   disturbance spreads through a power grid, a supply chain or a control loop.
 - **Biomechanics:** the descending neurons are where the brain hands off to the body. Connecting
   them to a musculoskeletal model is exactly the interface between neural control and mechanics.
+- **Robot control loops:** the Phase 4 loop is a sensor → estimator → policy → low-level controller
+  stack. Its lessons transfer directly: sample rates, zero-order holds, a one-tick delay for
+  causality, and latency budgets dominated by filters rather than the policy.
 
 </details>
 
@@ -242,6 +349,11 @@ pip install -e ".[dev,sim]"         # + Brian2 and PyTorch
 python scripts/download_data.py --shiu
 python scripts/run_phase3.py        # caches every simulation (~1 h on a laptop CPU)
 jupyter lab notebooks/03_spiking.ipynb
+
+# Phase 4: closed loop (needs Python >= 3.12 for flygym 2.x)
+pip install -e ".[dev,sim,control]"  # + flygym (NeuroMechFly v2, MuJoCo)
+python scripts/run_phase4.py --factorial   # which connectome? + every closed-loop run (~30-60 min)
+jupyter lab notebooks/04_control.ipynb
 ```
 
 ## Roadmap
@@ -249,7 +361,9 @@ jupyter lab notebooks/03_spiking.ipynb
 - [x] Phase 1: the brain as a signed sparse graph — `v0.1-graph`
 - [x] Phase 2: tracing sensorimotor pathways to the descending neurons — `v0.2-pathway`
 - [x] Phase 3: spiking simulation (Brian2 reference + PyTorch, batched, CPU/GPU) — `v0.3-spiking`
-- [ ] Phase 4: closed-loop control of a simulated fly body in MuJoCo
+- [x] Phase 4: closed-loop control of a simulated fly body in MuJoCo — `v0.4-control`
+- [ ] Next: retinotopic looming input (each LC4 sees its own patch of the eye), turning from
+  left/right DN asymmetry, and a takeoff program for the giant fiber
 
 ## Repository layout
 ```
@@ -266,8 +380,14 @@ src/c2c/sim/brian_lif.py           Brian2 reference simulator
 src/c2c/sim/torch_lif.py           batched sparse PyTorch simulator (event-driven or SpMM)
 src/c2c/analysis/spiking.py        sweeps, readout tables, simulator comparison, plots
 src/c2c/analysis/phase3.py         the Phase 3 experiments, cached
+src/c2c/control/body.py            NeuroMechFly v2 (flygym 2.1), walking controller, looming ball
+src/c2c/control/encoder.py         compound eye -> LPLC2 / LC4 Poisson rates
+src/c2c/control/decoder.py         escape DN spikes -> walking command
+src/c2c/control/loop.py            the brain-body loop in 1 ms lockstep, open-loop replay
+src/c2c/analysis/phase4.py         the Phase 4 experiments, cached; the giant-fiber factorial
 scripts/run_phase3.py              run every Phase 3 simulation from a terminal
-notebooks/                         01_graph.ipynb, 02_pathway.ipynb, 03_spiking.ipynb
+scripts/run_phase4.py              run every Phase 4 simulation from a terminal
+notebooks/                         01_graph … 04_control.ipynb
 tests/                             pytest on small hand-built circuits
 ```
 
@@ -283,4 +403,7 @@ Eckstein et al. 2024. Annotations: flyconnectome/flywire_annotations v3.2.0 — 
 Dorkenwald et al. 2024, Berg et al. 2026, Tastekin et al. 2026, Matsliah et al. 2024.
 Information-flow model: Schlegel et al. 2021 (eLife). Whole-brain LIF model and its connectome input:
 Shiu et al. 2024 (*Nature*), github.com/philshiu/Drosophila_brain_model. Simulators: Brian2
-(Stimberg et al. 2019, eLife) and PyTorch.
+(Stimberg et al. 2019, eLife) and PyTorch. Body: NeuroMechFly v2 (Wang-Chen et al. 2024, *Nature
+Methods*) through flygym 2.1 and MuJoCo. Looming encoding: von Reyn et al. 2017 (*Neuron*), Ache et
+al. 2019 (*Curr. Biol.*). Escape DN behaviours: Peek 2018 (PhD thesis, U. Chicago), Dombrovski et
+al. 2023 (*Nature*).

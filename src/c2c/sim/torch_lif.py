@@ -41,6 +41,16 @@ Spike propagation on a sparse W, two ways
   ``torch.sparse_csr_tensor`` and S the dense (N, B) spike matrix. Work ~ nnz(W) x B whether or
   not anything fired, but it is a single well-tuned library kernel, so it wins when activity is
   dense or on a GPU with large batches.
+
+Stepping (Phase 4)
+------------------
+A closed-loop controller cannot hand the brain its whole input up front: the input at 50 ms depends
+on what the body did at 49 ms. So all of the simulator's state (v, g, the delay and refractory
+rings, the random generator, the spike counters) lives in a ``LIFStepper`` object, and
+``stepper.step(n, rate_hz)`` advances it n time steps with the given input rates and returns who
+spiked. Calling ``step`` 100 times with 10 steps each is EXACTLY the same computation as one call
+with 1000 steps (same operations, same random numbers, same order), which the tests check spike for
+spike. ``simulate_torch`` is now just "make a stepper, step it once, collect the result".
 """
 
 from __future__ import annotations
@@ -121,7 +131,221 @@ class SpmmPropagator:
         g += torch.sparse.mm(self.W, S)
 
 
-@torch.no_grad()
+class LIFStepper:
+    """The whole simulator state, advanced a few steps at a time.
+
+    Constructor arguments are the ones of ``simulate_torch`` that describe the NETWORK and its
+    wiring to the outside world (who gets input, who is recorded). What changes over time, the
+    input rates, is passed to ``step``.
+
+        brain = LIFStepper(W, drive=looming_idx, n_trials=1, watch=escape_idx)
+        for tick in range(1000):                         # 1000 ticks of 1 ms
+            spikes = brain.step(10, rate_hz=encoder(obs)) # (len(watch), n_trials) spike counts
+        res = brain.result()                             # the usual SimResult for the whole run
+
+    drive  : neurons that receive Poisson input; their rates are set per ``step`` call
+    watch  : neurons whose spike counts ``step`` returns (default: all of them)
+    record : neurons whose spike times go into the raster (default: all)
+    forced : (neuron indices, times in ms) of single deterministic kicks, as in simulate_torch
+    """
+
+    @torch.no_grad()
+    def __init__(
+        self,
+        W: sparse.csr_matrix,
+        params: LIFParams = SHIU2024,
+        drive=(),
+        rate_hz=0.0,
+        n_trials: int = 1,
+        seed: int = 0,
+        forced=None,
+        i_bias=0.0,
+        record=None,
+        record_v=None,
+        watch=None,
+        mode: str = "event",
+        device=None,
+        dtype=torch.float32,
+    ):
+        self.params = params
+        self.device = device = torch.device(device) if device is not None else default_device()
+        self.dtype = dtype
+        self.mode = mode
+        self.gen = torch.Generator(device=device).manual_seed(seed)
+
+        self.n, self.B = n, B = W.shape[0], n_trials
+        self.D = params.delay_steps
+        self.R = params.refractory_steps
+        self.p_vv, self.p_vg, self.p_gg = params.propagators()
+        self.propagator = {"event": EventPropagator, "spmm": SpmmPropagator}[mode](
+            W, params.w_syn, dtype, device)
+
+        # --- external input ----------------------------------------------------------------
+        self.drive_np = np.asarray(drive, dtype=np.int64)
+        self.drive_t = torch.as_tensor(self.drive_np, device=device)
+        self.set_rates(rate_hz)
+        self.forced_at: dict[int, torch.Tensor] = {}
+        stimulated = set(self.drive_np.tolist())
+        if forced is not None:
+            f_idx = np.asarray(forced[0], dtype=np.int64)
+            f_step = np.array([params.steps(t) for t in np.asarray(forced[1], dtype=np.float64)])
+            for k in np.unique(f_step):
+                self.forced_at[int(k)] = torch.as_tensor(f_idx[f_step == k], device=device)
+            stimulated |= set(f_idx.tolist())
+        # Neurons that get external input have no refractory period (as in the paper).
+        self.has_refractory = torch.ones(n, dtype=torch.bool, device=device)
+        if stimulated:
+            self.has_refractory[sorted(stimulated)] = False
+
+        bias = np.broadcast_to(np.asarray(i_bias, dtype=np.float64), (n,))
+        self.bias_term = None
+        if np.any(bias != 0):  # constant drive enters like g but never decays: u += (1-P_vv) * I
+            self.bias_term = torch.as_tensor(bias * (1.0 - self.p_vv), dtype=dtype,
+                                             device=device)[:, None]
+
+        # --- what to report ----------------------------------------------------------------
+        self.keep = torch.ones(n, dtype=torch.bool, device=device)
+        if record is not None:
+            self.keep[:] = False
+            self.keep[torch.as_tensor(np.asarray(record, dtype=np.int64), device=device)] = True
+        self.vrec = None if record_v is None else torch.as_tensor(np.asarray(record_v),
+                                                                  device=device)
+        self.watch = None
+        if watch is not None:
+            w = torch.as_tensor(np.asarray(watch, dtype=np.int64), device=device)
+            # flat indices of (watched neuron, trial), in (len(watch), B) order
+            self.watch = (w[:, None] * B + torch.arange(B, device=device)[None, :]).reshape(-1)
+        self.reset_state()
+
+    def set_rates(self, rate_hz) -> None:
+        """Poisson rate (Hz) of every driven neuron: scalar, (n_trials,) or (n_drive, n_trials).
+        Stored as the probability of one event per time step, rate * dt."""
+        self.p_event = torch.as_tensor(
+            per_trial_rates(rate_hz, len(self.drive_np), self.B) * self.params.dt / 1000.0,
+            dtype=self.dtype, device=self.device)
+
+    @torch.no_grad()
+    def reset_state(self) -> None:
+        """Back to t = 0: everyone at rest, no spikes in flight, counters cleared. (The random
+        generator is NOT re-seeded, so a reset run is a new, independent sample.)"""
+        n, B, dev, dt = self.n, self.B, self.device, self.dtype
+        self.k = 0                                                   # steps done so far
+        self.v = torch.full((n, B), self.params.v_0, dtype=dt, device=dev)
+        self.g = torch.zeros((n, B), dtype=dt, device=dev)
+        self.empty = torch.zeros(0, dtype=torch.int64, device=dev)
+        self.delay_ring = [self.empty] * max(self.D, 1)             # spikes waiting D steps
+        self.refr_ring = [self.empty] * max(self.R - 1, 1)          # spikes of the last R-1 steps
+        self.counts = torch.zeros(n * B, dtype=torch.int32, device=dev)
+        self.first = torch.full((n * B,), -1, dtype=torch.int32, device=dev)
+        self.raster_chunks = []
+        self.v_chunks = []
+        self.wall_s = 0.0
+
+    @property
+    def t_ms(self) -> float:
+        """Simulated time so far in ms."""
+        return self.k * self.params.dt
+
+    @torch.no_grad()
+    def step(self, n_steps: int = 1, rate_hz=None, verbose: bool = False) -> np.ndarray:
+        """Advance ``n_steps`` time steps. ``rate_hz`` (if given) replaces the input rates first
+        and is held constant over these steps (zero-order hold).
+
+        Returns the number of spikes each watched neuron fired during these steps, as an int array
+        of shape (len(watch), n_trials) (all neurons if ``watch`` was None).
+        """
+        if rate_hz is not None:
+            self.set_rates(rate_hz)
+        P = self.params
+        v, g, B = self.v, self.g, self.B
+        D, R = self.D, self.R
+        p_vv, p_vg, p_gg = self.p_vv, self.p_vg, self.p_gg
+        empty = self.empty
+        before = (self.counts if self.watch is None else self.counts[self.watch]).clone()
+
+        t0 = time.perf_counter()
+        for _ in range(n_steps):
+            k = self.k
+            if self.vrec is not None:   # sampled at the START of the step, like Brian2's monitor
+                self.v_chunks.append(v[self.vrec].clone())
+            refractory = torch.cat(self.refr_ring) if R > 1 else empty
+
+            # 1. groups: exact propagator for everyone, then pin refractory neurons back
+            v.sub_(P.v_0).mul_(p_vv).add_(g, alpha=p_vg).add_(P.v_0)
+            if self.bias_term is not None:
+                v.add_(self.bias_term)
+            g.mul_(p_gg)
+            if refractory.numel():
+                v.view(-1)[refractory] = P.v_rst
+                g.view(-1)[refractory] = 0.0
+
+            # 2. thresholds (refractory neurons sit at v_rst < v_th, so they cannot fire)
+            spikes = (v.view(-1) > P.v_th).nonzero().squeeze(1)
+
+            # 3. synapses: spikes from step k - D arrive, then this step's external kicks
+            if D == 0:
+                arriving = spikes
+            else:
+                arriving = self.delay_ring[k % D]
+                self.delay_ring[k % D] = spikes
+            if arriving.numel():
+                self.propagator.add_(g, arriving)
+                if refractory.numel():                 # writes to refractory neurons are lost
+                    g.view(-1)[refractory] = 0.0
+            if len(self.drive_np):
+                events = torch.rand(self.p_event.shape, generator=self.gen, device=self.device,
+                                    dtype=self.dtype)
+                v[self.drive_t] += P.w_poi * (events < self.p_event).to(self.dtype)
+            if k in self.forced_at:
+                idx = self.forced_at[k]
+                v.index_add_(0, idx, torch.full((len(idx), B), P.w_poi, dtype=self.dtype,
+                                                device=self.device))
+
+            # 4. resets, bookkeeping
+            if spikes.numel():
+                v.view(-1)[spikes] = P.v_rst
+                g.view(-1)[spikes] = 0.0
+                self.counts[spikes] += 1
+                fs = self.first[spikes]
+                self.first[spikes] = torch.where(fs < 0, k, fs)
+                neuron = spikes // B
+                kept = spikes[self.keep[neuron]]
+                if kept.numel():
+                    self.raster_chunks.append(torch.stack([kept, torch.full_like(kept, k)], 1))
+                if R > 1:
+                    self.refr_ring[k % (R - 1)] = spikes[self.has_refractory[neuron]]
+            elif R > 1:
+                self.refr_ring[k % (R - 1)] = empty
+            self.k += 1
+
+            if verbose and self.k % max(1, n_steps // 10) == 0:
+                print(f"  step {self.k}/{n_steps}  {time.perf_counter() - t0:.1f} s")
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self.wall_s += time.perf_counter() - t0
+        after = self.counts if self.watch is None else self.counts[self.watch]
+        return (after - before).view(-1, B).cpu().numpy().astype(np.int64)
+
+    def result(self) -> SimResult:
+        """Everything so far as a SimResult (t_run = simulated time), same as simulate_torch."""
+        n, B, dt = self.n, self.B, self.params.dt
+        first_ms = self.first.view(n, B).cpu().numpy().astype(np.float64) * dt
+        first_ms[first_ms < 0] = np.nan
+        raster = {"trial": np.zeros(0, int), "neuron": np.zeros(0, int), "t": np.zeros(0)}
+        if self.raster_chunks:
+            r = torch.cat(self.raster_chunks).cpu().numpy()
+            raster = {"trial": r[:, 0] % B, "neuron": r[:, 0] // B, "t": r[:, 1] * dt}
+        v_trace = (torch.stack(self.v_chunks).cpu().numpy().astype(np.float64)
+                   if self.v_chunks else None)
+        return SimResult(counts=self.counts.view(n, B).cpu().numpy().astype(np.int64),
+                         first_spike=first_ms, t_run=self.t_ms, raster=raster, v_trace=v_trace,
+                         meta={"simulator": "torch", "mode": self.mode,
+                               "device": str(self.device),
+                               "dtype": str(self.dtype).replace("torch.", ""),
+                               "wall_s": self.wall_s})
+
+
 def simulate_torch(
     W: sparse.csr_matrix,
     params: LIFParams = SHIU2024,
@@ -146,125 +370,11 @@ def simulate_torch(
     mode   : "event" (default) or "spmm", see the module docstring
     device : "cpu", "cuda", ... (default: GPU if available)
     dtype  : torch.float32 (default, fast) or torch.float64 (bit-for-bit comparisons)
+
+    A one-shot run of a ``LIFStepper``: build it, step through the whole trial, collect.
     """
-    device = torch.device(device) if device is not None else default_device()
-    gen = torch.Generator(device=device).manual_seed(seed)
-
-    n, B = W.shape[0], n_trials
-    n_steps = params.steps(t_run)
-    D = params.delay_steps
-    R = params.refractory_steps
-    p_vv, p_vg, p_gg = params.propagators()
-    propagator = {"event": EventPropagator, "spmm": SpmmPropagator}[mode](
-        W, params.w_syn, dtype, device)
-
-    # --- external input --------------------------------------------------------------------
-    drive_np = np.asarray(drive, dtype=np.int64)
-    drive_t = torch.as_tensor(drive_np, device=device)
-    p_event = torch.as_tensor(per_trial_rates(rate_hz, len(drive_np), B) * params.dt / 1000.0,
-                              dtype=dtype, device=device)   # rate (Hz) * dt (ms) -> probability
-    forced_at: dict[int, torch.Tensor] = {}
-    stimulated = set(drive_np.tolist())
-    if forced is not None:
-        f_idx = np.asarray(forced[0], dtype=np.int64)
-        f_step = np.array([params.steps(t) for t in np.asarray(forced[1], dtype=np.float64)])
-        for k in np.unique(f_step):
-            forced_at[int(k)] = torch.as_tensor(f_idx[f_step == k], device=device)
-        stimulated |= set(f_idx.tolist())
-    # Neurons that get external input have no refractory period (as in the paper).
-    has_refractory = torch.ones(n, dtype=torch.bool, device=device)
-    if stimulated:
-        has_refractory[sorted(stimulated)] = False
-
-    bias = np.broadcast_to(np.asarray(i_bias, dtype=np.float64), (n,))
-    bias_term = None
-    if np.any(bias != 0):  # constant drive enters like g but never decays: u += (1-P_vv) * I
-        bias_term = torch.as_tensor(bias * (1.0 - p_vv), dtype=dtype, device=device)[:, None]
-
-    # --- state -----------------------------------------------------------------------------
-    v = torch.full((n, B), params.v_0, dtype=dtype, device=device)
-    g = torch.zeros((n, B), dtype=dtype, device=device)
-    empty = torch.zeros(0, dtype=torch.int64, device=device)
-    delay_ring = [empty] * max(D, 1)        # spikes waiting D steps for delivery
-    refr_ring = [empty] * max(R - 1, 1)     # spikes of the last R-1 steps (still refractory)
-
-    counts = torch.zeros(n * B, dtype=torch.int32, device=device)
-    first = torch.full((n * B,), -1, dtype=torch.int32, device=device)
-    keep = torch.ones(n, dtype=torch.bool, device=device)
-    if record is not None:
-        keep[:] = False
-        keep[torch.as_tensor(np.asarray(record, dtype=np.int64), device=device)] = True
-    raster_chunks = []
-    vrec = None if record_v is None else torch.as_tensor(np.asarray(record_v), device=device)
-    v_chunks = []
-
-    t0 = time.perf_counter()
-    for k in range(n_steps):
-        if vrec is not None:       # sampled at the START of the step, like Brian2's StateMonitor
-            v_chunks.append(v[vrec].clone())
-        refractory = torch.cat(refr_ring) if R > 1 else empty
-
-        # 1. groups: exact propagator for everyone, then pin refractory neurons back
-        v.sub_(params.v_0).mul_(p_vv).add_(g, alpha=p_vg).add_(params.v_0)
-        if bias_term is not None:
-            v.add_(bias_term)
-        g.mul_(p_gg)
-        if refractory.numel():
-            v.view(-1)[refractory] = params.v_rst
-            g.view(-1)[refractory] = 0.0
-
-        # 2. thresholds (refractory neurons sit at v_rst < v_th, so they cannot fire)
-        spikes = (v.view(-1) > params.v_th).nonzero().squeeze(1)
-
-        # 3. synapses: spikes from step k - D arrive, then this step's external kicks
-        if D == 0:
-            arriving = spikes
-        else:
-            arriving = delay_ring[k % D]
-            delay_ring[k % D] = spikes
-        if arriving.numel():
-            propagator.add_(g, arriving)
-            if refractory.numel():                 # writes to refractory neurons are lost
-                g.view(-1)[refractory] = 0.0
-        if len(drive_np):
-            events = torch.rand(p_event.shape, generator=gen, device=device, dtype=dtype)
-            v[drive_t] += params.w_poi * (events < p_event).to(dtype)
-        if k in forced_at:
-            v.index_add_(0, forced_at[k],
-                         torch.full((len(forced_at[k]), B), params.w_poi, dtype=dtype,
-                                    device=device))
-
-        # 4. resets, bookkeeping
-        if spikes.numel():
-            v.view(-1)[spikes] = params.v_rst
-            g.view(-1)[spikes] = 0.0
-            counts[spikes] += 1
-            fs = first[spikes]
-            first[spikes] = torch.where(fs < 0, k, fs)
-            neuron = spikes // B
-            kept = spikes[keep[neuron]]
-            if kept.numel():
-                raster_chunks.append(torch.stack([kept, torch.full_like(kept, k)], dim=1))
-            if R > 1:
-                refr_ring[k % (R - 1)] = spikes[has_refractory[neuron]]
-        elif R > 1:
-            refr_ring[k % (R - 1)] = empty
-
-        if verbose and (k + 1) % max(1, n_steps // 10) == 0:
-            print(f"  step {k + 1}/{n_steps}  {time.perf_counter() - t0:.1f} s")
-
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
-
-    first_ms = first.view(n, B).cpu().numpy().astype(np.float64) * params.dt
-    first_ms[first_ms < 0] = np.nan
-    raster = {"trial": np.zeros(0, int), "neuron": np.zeros(0, int), "t": np.zeros(0)}
-    if raster_chunks:
-        r = torch.cat(raster_chunks).cpu().numpy()
-        raster = {"trial": r[:, 0] % B, "neuron": r[:, 0] // B, "t": r[:, 1] * params.dt}
-    v_trace = torch.stack(v_chunks).cpu().numpy().astype(np.float64) if v_chunks else None
-    return SimResult(counts=counts.view(n, B).cpu().numpy().astype(np.int64),
-                     first_spike=first_ms, t_run=t_run, raster=raster, v_trace=v_trace,
-                     meta={"simulator": "torch", "mode": mode, "device": str(device),
-                           "dtype": str(dtype).replace("torch.", ""), "wall_s": wall})
+    sim = LIFStepper(W, params, drive=drive, rate_hz=rate_hz, n_trials=n_trials, seed=seed,
+                     forced=forced, i_bias=i_bias, record=record, record_v=record_v,
+                     watch=np.zeros(0, dtype=np.int64), mode=mode, device=device, dtype=dtype)
+    sim.step(params.steps(t_run), verbose=verbose)
+    return sim.result()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "connectome-control"
-version = "0.3.0"
+version = "0.4.0"
 description = "Turning the fruit fly connectome into a robot controller: graph analysis, spiking simulation, and closed-loop control in MuJoCo."
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,6 +24,12 @@ dependencies = [
 sim = [
     "brian2>=2.7",
     "torch>=2.2",
+]
+control = [
+    # NeuroMechFly v2 body (MuJoCo). flygym 2.x needs Python >= 3.12; its locomotion
+    # controllers (flygym_demo.complex_terrain) ship in the same wheel.
+    "flygym>=2.1.1,<2.2; python_version >= '3.12'",
+    "pillow>=11",
 ]
 dev = [
     "pytest>=8",
