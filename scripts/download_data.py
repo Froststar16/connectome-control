@@ -8,10 +8,14 @@ Sources (both CC-BY 4.0):
 
   * Optional (--shiu, Phase 3): the connectivity table of Shiu et al. 2024 (Nature), from their
     repository github.com/philshiu/Drosophila_brain_model, pinned to a commit (~100 MB).
+  * Eye map (Phase 5, small): FlyWire right-optic-lobe column assignments (Matsliah et al. 2024,
+    Nature) and ommatidium viewing directions (Zhao et al. 2025, Nature), as packaged in
+    github.com/YijieYin/connectome_interpreter (MIT licence), pinned to a commit.
 
 Usage:
-    python scripts/download_data.py              # downloads everything into data/raw/
+    python scripts/download_data.py              # Zenodo + annotations + eye map into data/raw/
     python scripts/download_data.py --shiu       # ...plus the Shiu et al. table for Phase 3
+    python scripts/download_data.py --minimal    # only what Phases 4-5 need (~130 MB, no Zenodo)
     python scripts/download_data.py --data-dir /some/other/path
 """
 
@@ -60,6 +64,26 @@ SHIU_FILES = {
         "3d802fd542b5d18570ba1ba0bb0abed9",
     ),
 }
+
+# Phase 5 eye map, pinned to commit aaa7e73 of YijieYin/connectome_interpreter.
+EYEMAP_COMMIT = "aaa7e738c161bbb6c475e092ca18c4b11e8e6324"
+EYEMAP_RAW = ("https://raw.githubusercontent.com/YijieYin/connectome_interpreter/"
+              f"{EYEMAP_COMMIT}/connectome_interpreter/data")
+EYEMAP_FILES = {
+    "matsliah2024_fafb_right_columns.csv": (
+        f"{EYEMAP_RAW}/Matsliah2024/fafb_right_vis_cols.csv",
+        "342a12b2da2f8e41f147e65c90e65a36",
+    ),
+    "zhao2025_eyemap_right.csv": (
+        f"{EYEMAP_RAW}/Zhao2024/ucl_hex_right_20240701_tomale.csv",
+        "22765893f44bcfec66fbf4246acc1aca",
+    ),
+}
+
+# What the closed-loop phases need: annotations, the Shiu table (graph variant shiu_min5) and
+# the eye map. The Zenodo connectivity (~1 GB) is only needed for Phases 1-3 and the "ours"
+# graph variants.
+ANNOTATIONS = f"neuron_annotations_{ANNOTATIONS_TAG}.tsv"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHUNK = 1 << 20  # 1 MiB
@@ -116,10 +140,17 @@ def main() -> None:
         "--shiu", action="store_true",
         help="also download the Shiu et al. 2024 connectivity table (Phase 3 comparison)",
     )
+    parser.add_argument(
+        "--minimal", action="store_true",
+        help="only the files Phases 4-5 need: annotations, Shiu table, eye map (no Zenodo)",
+    )
     args = parser.parse_args()
     args.data_dir.mkdir(parents=True, exist_ok=True)
 
-    files = FILES | (SHIU_FILES if args.shiu else {})
+    if args.minimal:
+        files = {ANNOTATIONS: FILES[ANNOTATIONS]} | SHIU_FILES | EYEMAP_FILES
+    else:
+        files = FILES | EYEMAP_FILES | (SHIU_FILES if args.shiu else {})
     for name, (url, md5) in files.items():
         fetch(name, url, md5, args.data_dir)
     print(f"\nAll files ready in {args.data_dir}")

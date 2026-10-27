@@ -39,6 +39,7 @@ A6. Competition. Walking and the two escape programs are mixed as a weighted ave
     No gains to tune except r50, and s stays inside [-v_back, max(base, v_fwd)], which keeps the
     walking controller in its stable range.
 A7. Both sides get the same command (no turning): the stimulus in our experiments is frontal.
+    Phase 5 drops A7: see ``SteeringDecoder`` at the end of this file.
 """
 
 from __future__ import annotations
@@ -101,3 +102,67 @@ class EscapeDecoder:
     def step(self, counts: np.ndarray, dt_ms: float) -> np.ndarray:
         self.update_rates(counts, dt_ms)
         return self.command()
+
+
+# ---- Phase 5: turning away -----------------------------------------------------------------------
+@dataclass
+class SteeringDecoder(EscapeDecoder):
+    """EscapeDecoder plus steering from the left/right asymmetry of the escape DNs.
+
+    Differential drive
+    ------------------
+    flygym's ``HybridTurningController`` steers like a tank or a differential-drive robot: the
+    two descending signals set how hard the legs of each side step. Measured on the body
+    (notebook 05, steering calibration), s_L > s_R makes the fly yaw clockwise (turn right) and
+    s_L < s_R anticlockwise, whether it is walking forwards or backwards. So we split the command
+    the way a mobile-robot controller does, into a translational part v and a turning part w:
+
+        s_L = v + w,      s_R = v - w            (clipped to +/- v_max)
+
+    v is exactly the Phase 4 command (A1-A6). w is new.
+
+    The steering term (assumptions S1-S3)
+    -------------------------------------
+    S1. Each side's escape DNs report a threat on that side. LPLC2 and LC4 are ipsilateral:
+        an optic lobe's cells send their axons to the same side's optic glomeruli, and the DNs
+        there get most of their LC input from the same side (checked in notebook 05, section 2).
+    S2. Flies escape AWAY from a threat. A looming object in front makes them jump backwards,
+        one behind makes them jump forwards, and one at the side makes them jump about halfway
+        between straight away and straight forward (Card & Dickinson 2008, Curr. Biol.). On
+        foot, "away" from a side threat means turning towards the opposite side: more escape
+        drive on the left -> turn right.
+    S3. Same competition rule as A6. Per side, D = (summed backward + forward escape DN rate on
+        that side) / r50, and
+
+            w = k_turn * (D_L - D_R) / (1 + D_L + D_R)
+
+        No escape activity -> w = 0 (walk straight). Activity on one side only -> |w| grows
+        towards k_turn as that side's DNs fire harder. Equal activity on both sides (a frontal
+        threat) -> w = 0. One new constant, k_turn, set from the steering calibration so that
+        full asymmetry gives a fast but stable turn.
+
+    What this does NOT claim: that DNp02/DNp04/DNp11 themselves steer. The identified walking
+    steering neurons are others (e.g. DNa02, which turns the fly TOWARDS its own side; Rayshubskiy
+    et al., eLife). S1-S3 are a functional mapping from "where is the threat" to "turn away", with
+    the left/right signal taken from where the model brain actually carries it.
+    """
+
+    k_turn: float = 0.6            # steering gain (S3)
+    v_max: float = 1.2             # clip, the controller's stable range
+
+    def side_drive(self, rates: np.ndarray | None = None) -> np.ndarray:
+        """(D_L, D_R): escape-program drive of each side, (backward + forward DN rates) / r50."""
+        r = self.rates if rates is None else np.asarray(rates, dtype=float)
+        escape = self._back | self._fwd
+        sides = np.array([n.split(" ")[-1] for n in self.neurons])
+        return np.array([r[escape & (sides == s)].sum() / self.r50 for s in ("L", "R")])
+
+    def turn(self, rates: np.ndarray | None = None) -> float:
+        """Steering term w (S3): positive = turn right (clockwise seen from above)."""
+        d_l, d_r = self.side_drive(rates)
+        return float(self.k_turn * (d_l - d_r) / (1.0 + d_l + d_r))
+
+    def command(self, rates: np.ndarray | None = None) -> np.ndarray:
+        v = super().command(rates)[0]
+        w = self.turn(rates)
+        return np.clip(np.array([v + w, v - w]), -self.v_max, self.v_max)

@@ -58,6 +58,8 @@ class LoopLog:
     thorax: list = field(default_factory=list)         # mm, end of tick
     head: list = field(default_factory=list)
     ball: list = field(default_factory=list)
+    yaw: list = field(default_factory=list)            # deg, thorax heading at end of tick
+    drive: list = field(default_factory=list)          # Hz per driven neuron (if log_drive)
 
     def arrays(self) -> dict[str, np.ndarray]:
         return {k: np.asarray(v) for k, v in self.__dict__.items()}
@@ -65,7 +67,8 @@ class LoopLog:
 
 class ClosedLoop:
     def __init__(self, arena, brain, encoder, decoder, drive_groups, mode: str = "closed",
-                 replay=None, tick_ms: float = 1.0, vision_ms: float = 2.0):
+                 replay=None, tick_ms: float = 1.0, vision_ms: float = 2.0,
+                 log_drive: bool = False):
         """
         arena        c2c.control.body.FlyArena
         brain        c2c.sim.torch_lif.LIFStepper, watching the decoder's DNs in order
@@ -74,6 +77,11 @@ class ClosedLoop:
         decoder      c2c.control.decoder.EscapeDecoder
         drive_groups from encoder.looming_drive, matching the brain's drive indices
         replay       for mode="open": function t_ms -> {"LPLC2": (2,), "LC4": (2,)}
+        log_drive    also log the rate of every driven neuron (Phase 5, retinotopic input)
+
+        The encoder turns its own output into one rate per driven neuron
+        (``encoder.neuron_rates``): the same rate for a whole side (LoomingEncoder) or one per
+        neuron (RetinotopicEncoder). A replayed trace is always per side.
         """
         if mode not in ("closed", "open", "no_brain"):
             raise ValueError(f"unknown mode {mode!r}")
@@ -86,6 +94,7 @@ class ClosedLoop:
             raise ValueError("brain dt and physics timestep must be equal")
         self.n_vision = round(vision_ms / tick_ms)          # ticks per vision frame
         self.tick_ms = tick_ms
+        self.log_drive = log_drive
 
     def run(self, t_run_ms: float, verbose: bool = False) -> LoopLog:
         log = LoopLog()
@@ -105,9 +114,12 @@ class ClosedLoop:
                 rates = self.encoder.update(self.arena.vision(), t)
             c1 = time.perf_counter()
             # 2. THINK
+            drive_hz = None
+            if self.groups:                       # no groups: nothing is driven (no_brain)
+                drive_hz = (rates_for_drive(self.groups, rates) if self.mode == "open"
+                            else self.encoder.neuron_rates(rates, self.groups))
             if self.brain is not None:
-                counts = self.brain.step(self.n_tick, rate_hz=rates_for_drive(self.groups, rates)
-                                         [:, None])[:, 0]
+                counts = self.brain.step(self.n_tick, rate_hz=drive_hz[:, None])[:, 0]
             else:
                 counts = np.zeros(n_dn, dtype=np.int64)
             c2 = time.perf_counter()
@@ -133,6 +145,10 @@ class ClosedLoop:
             log.thorax.append(self.arena.thorax())
             log.head.append(self.arena.head())
             log.ball.append(self.arena.ball())
+            if hasattr(self.arena, "heading"):
+                log.yaw.append(self.arena.heading())
+            if self.log_drive and drive_hz is not None:
+                log.drive.append(np.asarray(drive_hz, dtype=np.float32).copy())
             command = next_command
             if verbose and (k + 1) % max(1, n_ticks // 10) == 0:
                 print(f"  {t + self.tick_ms:6.0f} ms  wall " +

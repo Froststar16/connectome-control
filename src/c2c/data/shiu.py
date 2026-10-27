@@ -74,3 +74,31 @@ def load_shiu_graph(path: str | Path | None = None, min_syn: int = 1) -> Graph:
         "nt_type": np.where(con["Excitatory"].to_numpy() > 0, "ACH", "GABA"),
     })
     return build_graph(edges)
+
+
+def input_synapses(post_ids, path: str | Path | None = None) -> pd.DataFrame:
+    """Every synapse onto the given neurons (no threshold), from the same table.
+
+    Returns columns pre, post, syn (one row per connected pair). Phase 5 uses this to find where
+    on the eye an LPLC2 or LC4 neuron gets its input: single-synapse contacts from columnar cells
+    are part of a receptive field, so nothing is thresholded away here.
+    """
+    path = Path(path) if path is not None else RAW / SHIU_CONNECTIVITY
+    post_ids = [int(i) for i in np.asarray(post_ids, dtype=np.int64)]
+    con = pd.read_parquet(path, columns=["Presynaptic_ID", "Postsynaptic_ID", "Connectivity"],
+                          filters=[("Postsynaptic_ID", "in", post_ids)])
+    return pd.DataFrame({"pre": con["Presynaptic_ID"].to_numpy(np.int64),
+                         "post": con["Postsynaptic_ID"].to_numpy(np.int64),
+                         "syn": con["Connectivity"].to_numpy(np.int64)})
+
+
+def output_synapses(pre_ids, post_ids, path: str | Path | None = None) -> pd.DataFrame:
+    """Every synapse from ``pre_ids`` onto ``post_ids`` (pre, post, syn), no threshold."""
+    path = Path(path) if path is not None else RAW / SHIU_CONNECTIVITY
+    pre = [int(i) for i in np.asarray(pre_ids, dtype=np.int64)]
+    post = [int(i) for i in np.asarray(post_ids, dtype=np.int64)]
+    con = pd.read_parquet(path, columns=["Presynaptic_ID", "Postsynaptic_ID", "Connectivity"],
+                          filters=[("Presynaptic_ID", "in", pre), ("Postsynaptic_ID", "in", post)])
+    return pd.DataFrame({"pre": con["Presynaptic_ID"].to_numpy(np.int64),
+                         "post": con["Postsynaptic_ID"].to_numpy(np.int64),
+                         "syn": con["Connectivity"].to_numpy(np.int64)})

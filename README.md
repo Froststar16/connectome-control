@@ -5,9 +5,11 @@ wired in. This project reads that wiring from the FlyWire whole-brain connectome
 and asks a robotics question: **if you know which neural pathway produces which action, can you
 use the brain's own wiring as a controller?**
 
-**Status:** Phase 4 complete (`v0.4-control`): the spiking brain now drives a simulated fly body.
-It sees a ball coming, is told to back up about 10 ms after its looming detectors first fire, and
-then holds its distance from the ball, a behaviour nobody programmed.
+**Status:** v1.0. The spiking brain drives a simulated fly body in MuJoCo. It sees a ball coming,
+backs up about 10 ms after its looming detectors first fire, holds its distance from the ball (a
+behaviour nobody programmed), and turns away from a ball that comes from the side. The direction it
+should escape in is decided by how many synapses each eye neuron makes, as a 2023 *Nature* paper
+predicted.
 
 ## The 30-second version
 
@@ -25,6 +27,9 @@ then holds its distance from the ball, a behaviour nobody programmed.
 - Then I gave it a body: NeuroMechFly in MuJoCo, with compound eyes feeding the looming detectors
   and the escape neurons steering the legs, all in one 0.1 ms lockstep loop. Cut one input pathway
   and the escape comes 60 ms late; cut the other and the giant fiber loses 81% of its spikes.
+- Then I gave every eye neuron its own patch of the visual field, worked out from its synapses, and
+  let the fly steer. Where the threat is now decides which escape neurons fire, and the fly turns
+  away from it, in every one of 28 off-axis runs.
 
 ![The looming-escape circuit](results/figures/looming_escape_circuit.png)
 
@@ -48,6 +53,7 @@ flowchart LR
     D --> E[Phase 3<br/>spiking simulation<br/>Brian2 reference + PyTorch]
     E --> F[Phase 4<br/>eyes → brain → descending neurons<br/>→ MuJoCo body, closed loop]
     F -->|the fly moves, its eyes see something new| F
+    F --> G[Phase 5<br/>receptive fields from wiring<br/>steering: turn away from the threat]
 ```
 
 ## What I found
@@ -183,9 +189,75 @@ the standoff: less gain from looming to backing up, so the set point moves close
 **Which connectome?** Phase 3 left a question: on my graph the giant fiber barely fires, on Shiu
 et al.'s it fires second. A one-change-at-a-time chain of graph variants answers it: keeping my
 ≥5-synapse edges but giving each neuron one sign (`shiu_min5`) makes it fire like the full graph
-(142–169 Hz vs 153–172 Hz at 100 Hz input). The synapse threshold is harmless here; the sign rule
-decides. Phase 4 runs on `shiu_min5`: it matches recordings (LC4 and LPLC2 excite the giant
+(142–169 Hz vs 153–172 Hz at 100 Hz input). Counting modulatory synapses as excitatory on my own
+signs (`ours_mod`) only lifts it from 0–24 Hz to 11–51 Hz. The synapse threshold is harmless here;
+the per-edge vs per-neuron sign rule decides. Phase 4 runs on `shiu_min5`: it matches recordings (LC4 and LPLC2 excite the giant
 fiber), respects Dale's principle, and is 5.6× smaller than the full graph.
+
+## Which way to run (Phase 5)
+
+Phase 4's fly knew *that* something was coming, not *where* from: every looming detector on one
+side got the same input, and both sides of the body got the same command. Real flies jump backwards
+from a threat in front and forwards from one behind. Dombrovski et al. (*Nature* 2023) found part
+of the wiring for that: LC4 neurons that look forward make more synapses onto DNp02 (backward
+escape), those that look back make more onto DNp11 (forward escape). The direction of the escape
+is stored in synapse counts.
+
+To use that, each of the 314 looming detectors needs to know where it looks. No electrodes, so I
+read it off the wiring. The optic lobe is built from columns, one per ommatidium, and a columnar
+cell's column says where it looks. Chaining a published column map of FlyWire (Matsliah et al. 2024)
+with a micro-CT map of where every ommatidium points (Zhao et al. 2025, measured on a different
+fly) gives each columnar cell a direction, and each LPLC2/LC4 neuron a receptive field: where its
+input synapses come from. Checked on the side where the true columns are known: centres within 1.2°.
+
+![Dombrovski gradients in FlyWire](results/figures/phase5_dombrovski_gradients.png)
+
+*Synapses from each LC4 (or LPLC2) neuron onto the same-side escape neuron, against where its
+receptive field is. Every point is one neuron; its position comes from my receptive fields, not the
+paper's.*
+
+**The predicted gradients are there** (LC4 → DNp11 r = +0.79, LC4 → DNp02 r = −0.51, LPLC2 → giant
+fiber r = +0.55, all p < 1e-7), and every one of these synapses stays on its own side of the brain.
+
+**And they do what they were predicted to do, but only if the input is retinotopic.** Recording
+what a standing fly's eyes see and replaying it into the brain alone:
+
+![Forward-escape share vs ball direction](results/figures/phase5_brain_replay.png)
+
+| ball direction | 0° (ahead) | 30° | 60° | 90° | 120° (behind) |
+|---|---|---|---|---|---|
+| forward-escape share, retinotopic input | **0.00** | 0.20 | 0.41 | 0.62 | **0.76** |
+| forward-escape share, uniform input (Phase 4) | 0.50 | 0.52 | 0.52 | 0.52 | 0.50 |
+
+*Share of DNp11 in DNp02 + DNp11 spikes on the ball's side, 10 trials each.*
+
+With a receptive field per neuron, a ball ahead gets a purely backward program and a ball from
+behind a mostly forward one, which is the behaviour measured in flies (Card & Dickinson 2008),
+falling out of synapse counts. With Phase 4's uniform input the share is flat: the gradients are
+still in the wiring, but the encoder has already averaged away the information they read. **An
+encoder can erase exactly what the downstream wiring is built to use.**
+
+**Steering.** flygym's walking controller takes one number per side of the body, so it steers like
+a differential-drive robot. I measured its steering curve first (≈265°/s per unit of left/right
+difference when walking forward, about a sixth of that when walking backwards), then added a turning term
+to the decoder: more escape activity on the left turns the fly right. One new gain.
+
+![A ball from the left, seen from above](results/figures/phase5_side_approach_az+90.gif)
+
+*A ball from the left. Only the left escape neurons fire, the left legs step harder, the fly turns
+about 50° right and walks off. 1/10 speed.*
+
+| 3 seeds per direction | ball from the left (45°, 90°) | ball from the right (−45°, −90°) | ahead (bearing −2°) |
+|---|---|---|---|
+| turned away, uniform input | 6 / 6 (46–74° right) | 6 / 6 (37–60° left) | backed straight away |
+| turned away, retinotopic input | 6 / 6 (28–58° right) | 6 / 6 (23–53° left) | barely turned (3°) |
+
+Two caveats the numbers make me state. Turning away doesn't need retinotopy: left vs right was
+already in Phase 4's per-eye input, and uniform input actually turns harder because it drives twice
+as many escape spikes. What retinotopy adds is the forward/backward choice above, and in the walking
+body that choice is blurred: a fly that is backing up can barely steer. The clean test is the
+brain-alone replay; the closed loop shows the result survives a body and feedback. (The two
+"frontal" seeds whose ball arrived 13–27° off-centre also turned away; they're counted in the 28.)
 
 <details>
 <summary><b>Things that surprised me</b></summary>
@@ -232,6 +304,20 @@ fiber), respects Dale's principle, and is 5.6× smaller than the full graph.
   that actually approaches.
 - **Phase 4:** the hovering came as a surprise. I gave the ball a stop so the runs would end
   cleanly, and the closed-loop fly turned the stop into a standoff.
+- **Phase 5:** an eye map measured with micro-CT on one fly, drawn on the grid of a different
+  connectome, lined up with FlyWire's columns with a single shift: 794 of 796 columns. Two flies,
+  two labs, one lattice.
+- **Phase 5:** my first "frontal" ball arrived 13° to the right. The walking controller drifts left
+  about 13° per second, so by the time the ball got close, straight ahead had moved. The ball now
+  aims where the fly will be, like a predator leading its target.
+- **Phase 5:** I expected retinotopy to be what makes the fly turn. It isn't: Phase 4's input already
+  knew left from right. Its real contribution, the forward/backward choice, only showed up when I
+  took the body away and replayed the input into the brain alone.
+- **Phase 5:** the backward gait has about a sixth of the forward gait's steering authority, so a
+  fly that is backing away from something can hardly turn. Measuring the actuator before writing
+  the controller saved me from blaming the brain for a body limit.
+- **Phase 5:** two gradients I wasn't looking for: ventral-looking LC4s and front-looking LPLC2s
+  make more synapses onto DNp04. I haven't found them in the papers I read.
 
 </details>
 
@@ -330,6 +416,38 @@ The tools here are about directed, weighted, signed graphs, not flies specifical
 - **Robot control loops:** the Phase 4 loop is a sensor → estimator → policy → low-level controller
   stack. Its lessons transfer directly: sample rates, zero-order holds, a one-tick delay for
   causality, and latency budgets dominated by filters rather than the policy.
+- **Sensor encoding for learned or wired policies:** Phase 5's uniform encoder fed the brain the
+  right features and still threw away the direction, because it pooled over space before the
+  policy could. Same failure as global-average-pooling a camera image before a controller that
+  needs to know where the obstacle is.
+- **Sensor-to-actuator calibration:** the steering curve is system identification of a
+  differential-drive base; measuring it first showed which behaviours the body could not produce
+  whatever the controller asked for.
+
+</details>
+
+<details>
+<summary><b>How the directional escape works</b></summary>
+
+- **Columns → directions.** Matsliah et al.'s 796 FlyWire columns, shifted onto Zhao et al.'s
+  eye map by the lattice offset that overlaps the most sites (794 / 796); orientation checked
+  against lamina cell-body positions. Left optic lobe: an iterative-closest-point reflection
+  (orthogonal Procrustes with det = −1) maps left cell bodies onto right ones of the same type.
+- **Receptive fields.** Centre = synapse-weighted mean direction of a neuron's columnar inputs;
+  width = their weighted angular spread. Widths scaled by one factor so the median LPLC2 matches
+  its measured 60° receptive field.
+- **Eye geometry.** Each flygym ommatidium's viewing direction, by running its renderer
+  backwards: corrected pixel → fisheye lookup → ray through the pinhole → world. Tested by placing
+  a ball along computed directions (within 3°).
+- **Encoder.** Rate = Phase 4's feature tuning (size or expansion speed) × a Gaussian spatial
+  factor: how close to the neuron's centre the dark object reaches. When every centre is covered it
+  reduces exactly to the Phase 4 encoder (tested).
+- **Steering decoder.** Differential drive: left = v + w, right = v − w. v is Phase 4's command;
+  w = k × (left − right escape drive) / (1 + left + right). Every mapping is a stated assumption
+  with its source, in `decoder.py`.
+- **Tests.** 23 new: lattice registration on a known shift, mirror fit on a known reflection,
+  receptive field by hand, the encoder's Gaussian tuning and population code, the decoder's
+  symmetry and limits, the experiment readouts, plus the gradient check on real data. 108 in total.
 
 </details>
 
@@ -354,7 +472,15 @@ jupyter lab notebooks/03_spiking.ipynb
 pip install -e ".[dev,sim,control]"  # + flygym (NeuroMechFly v2, MuJoCo)
 python scripts/run_phase4.py --factorial   # which connectome? + every closed-loop run (~30-60 min)
 jupyter lab notebooks/04_control.ipynb
+
+# Phase 5: directional escape
+python scripts/download_data.py --minimal  # annotations + Shiu table + eye map (no 1 GB Zenodo file)
+python scripts/run_phase5.py               # receptive fields, gradients, every run (~1-2 h)
+jupyter lab notebooks/05_directional.ipynb
 ```
+
+Only want the closed-loop fly? `pip install -e ".[dev,sim,control]"`, then
+`python scripts/download_data.py --minimal` and `python scripts/run_phase5.py --seeds 0` (~30 min).
 
 ## Roadmap
 - [x] Phase 0: data pipeline (download, checksums, neuropil collapse, threshold)
@@ -362,8 +488,10 @@ jupyter lab notebooks/04_control.ipynb
 - [x] Phase 2: tracing sensorimotor pathways to the descending neurons — `v0.2-pathway`
 - [x] Phase 3: spiking simulation (Brian2 reference + PyTorch, batched, CPU/GPU) — `v0.3-spiking`
 - [x] Phase 4: closed-loop control of a simulated fly body in MuJoCo — `v0.4-control`
-- [ ] Next: retinotopic looming input (each LC4 sees its own patch of the eye), turning from
-  left/right DN asymmetry, and a takeoff program for the giant fiber
+- [x] Phase 5: receptive fields from wiring, directional escape and steering — `v1.0`
+- [ ] Ideas beyond v1.0: a takeoff program for the giant fiber (a body that can fly), motion
+  detectors inside each receptive field instead of the separable model, and steering through the
+  fly's own steering neurons (DNa02) instead of a functional map
 
 ## Repository layout
 ```
@@ -381,13 +509,16 @@ src/c2c/sim/torch_lif.py           batched sparse PyTorch simulator (event-drive
 src/c2c/analysis/spiking.py        sweeps, readout tables, simulator comparison, plots
 src/c2c/analysis/phase3.py         the Phase 3 experiments, cached
 src/c2c/control/body.py            NeuroMechFly v2 (flygym 2.1), walking controller, looming ball
-src/c2c/control/encoder.py         compound eye -> LPLC2 / LC4 Poisson rates
-src/c2c/control/decoder.py         escape DN spikes -> walking command
+src/c2c/control/encoder.py         compound eye -> LPLC2 / LC4 Poisson rates (uniform or retinotopic)
+src/c2c/control/decoder.py         escape DN spikes -> walking command (+ steering)
 src/c2c/control/loop.py            the brain-body loop in 1 ms lockstep, open-loop replay
 src/c2c/analysis/phase4.py         the Phase 4 experiments, cached; the giant-fiber factorial
+src/c2c/data/eyemap.py             columns + eye map -> viewing directions -> receptive fields
+src/c2c/analysis/phase5.py         the Phase 5 experiments, cached; gradients, replay, steering curve
 scripts/run_phase3.py              run every Phase 3 simulation from a terminal
 scripts/run_phase4.py              run every Phase 4 simulation from a terminal
-notebooks/                         01_graph … 04_control.ipynb
+scripts/run_phase5.py              run every Phase 5 computation from a terminal
+notebooks/                         01_graph … 05_directional.ipynb
 tests/                             pytest on small hand-built circuits
 ```
 
@@ -406,4 +537,7 @@ Shiu et al. 2024 (*Nature*), github.com/philshiu/Drosophila_brain_model. Simulat
 (Stimberg et al. 2019, eLife) and PyTorch. Body: NeuroMechFly v2 (Wang-Chen et al. 2024, *Nature
 Methods*) through flygym 2.1 and MuJoCo. Looming encoding: von Reyn et al. 2017 (*Neuron*), Ache et
 al. 2019 (*Curr. Biol.*). Escape DN behaviours: Peek 2018 (PhD thesis, U. Chicago), Dombrovski et
-al. 2023 (*Nature*).
+al. 2023 (*Nature*). Column assignments: Matsliah et al. 2024 (*Nature*); ommatidium viewing
+directions: Zhao et al. 2025 (*Nature*); both as packaged in github.com/YijieYin/connectome_interpreter
+(MIT). Escape direction vs threat direction: Card & Dickinson 2008 (*Curr. Biol.*). LPLC2 receptive
+field size: Klapoetke et al. 2017 (*Nature*).

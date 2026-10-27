@@ -67,7 +67,8 @@ class FlyArena:
     """NeuroMechFly + walking controller + looming ball, wrapped for the closed loop."""
 
     def __init__(self, ball_radius: float = 2.0, render: bool = False,
-                 render_fps: int = 30, playback_speed: float = 0.1, seed: int = 0):
+                 render_fps: int = 30, playback_speed: float = 0.1, seed: int = 0,
+                 camera: str = "side"):
         import mujoco as mj
         from flygym import Simulation
         from flygym.anatomy import BodySegment, ContactBodiesPreset
@@ -90,17 +91,26 @@ class FlyArena:
                                                   pos=[500.0, 0.0, 1.0])
         ball.add_geom(type=mj.mjtGeom.mjGEOM_SPHERE, size=[ball_radius, 0, 0],
                       rgba=[0, 0, 0, 1], contype=0, conaffinity=0)
-        camera = None
-        if render:
+        cam = None
+        if render and camera == "side":
             # A fixed side-view camera in the world, looking at the space in front of the fly.
-            camera = world.mjcf_root.worldbody.add_camera(
+            cam = world.mjcf_root.worldbody.add_camera(
                 name="side_cam", pos=[5.0, -17.0, 5.5], fovy=45.0,
                 xyaxes=[1, 0, 0, 0, 0.26, 0.97])
+        elif render and camera == "top":
+            # Looking straight down on the space the fly walks through (x 0-14 mm), x (forward)
+            # to the right of the image and y (left) up: turning shows up as rotation (Phase 5).
+            cam = world.mjcf_root.worldbody.add_camera(
+                name="top_cam", pos=[7.0, 2.5, 28.0], fovy=45.0,
+                xyaxes=[1, 0, 0, 0, 1, 0])
+        elif render:
+            raise ValueError(f"unknown camera {camera!r}; choose 'side' or 'top'")
         self.fly, self.world, self.ball_radius = fly, world, ball_radius
         self.sim = Simulation(world)
         self.dt_ms = self.sim.timestep * 1000.0
         if render:
-            self.sim.set_renderer([camera], camera_res=(360, 640), playback_speed=playback_speed,
+            res = (360, 640) if camera == "side" else (480, 480)
+            self.sim.set_renderer([cam], camera_res=res, playback_speed=playback_speed,
                                   output_fps=render_fps)
         self.render = render
 
@@ -147,6 +157,47 @@ class FlyArena:
 
     def ball(self) -> np.ndarray:
         return self.sim.mj_data.mocap_pos[0].copy()
+
+    def heading(self) -> float:
+        """Yaw of the thorax in degrees (0 = facing +x, positive = turned left, i.e.
+        counter-clockwise seen from above), from its orientation quaternion (w, x, y, z)."""
+        w, x, y, z = self.sim.get_body_rotations(self.fly.name)[self._thorax]
+        return float(np.degrees(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))))
+
+    def ommatidia_directions(self) -> np.ndarray:
+        """Viewing direction of every ommatidium, (2 eyes, 721, 3) unit vectors in the HEAD frame
+        (x forward, y left, z up).
+
+        flygym renders each eye with a pinhole camera (157 deg field of view, 512 x 450 pixels),
+        bends the image with a fisheye lookup table, and averages the pixels inside each
+        ommatidium's hexagon. Following one pixel backwards: corrected pixel -> raw pixel (the
+        lookup table) -> ray through the pinhole (camera intrinsics) -> world (camera
+        orientation). An ommatidium looks along the average ray of its pixels. The head is rigid
+        on this body, so the result is fixed for the whole run."""
+        import mujoco as mj
+        from flygym.vision.retina import Retina
+
+        ret = Retina()
+        h, w = ret.nrows, ret.ncols
+        omm = ret.ommatidia_id_map.ravel().astype(np.int64) - 1     # -1 = between hexagons
+        ok = (omm >= 0) & (ret._fisheye_lookup >= 0)
+        row, col = np.divmod(ret._fisheye_lookup[ok], w)
+        omm = omm[ok]
+        head_rot = np.zeros(9)                           # the head is fused into the thorax
+        mj.mju_quat2Mat(head_rot, self.sim.get_body_rotations(self.fly.name)[self._head])
+        head_rot = head_rot.reshape(3, 3)
+        out = np.zeros((2, ret.num_ommatidia_per_eye, 3))
+        for e, cam_id in enumerate(self.sim._intern_eye_camera_ids_by_fly[self.fly.name]):
+            f = (h / 2) / np.tan(np.radians(self.sim.mj_model.cam_fovy[cam_id]) / 2)
+            # MuJoCo camera frame: looks along -z, image x to the right, image y up
+            ray = np.stack([col + 0.5 - w / 2, h / 2 - row - 0.5, np.full(len(row), -f)], 1)
+            ray /= np.linalg.norm(ray, axis=1, keepdims=True)
+            acc = np.zeros((ret.num_ommatidia_per_eye, 3))
+            np.add.at(acc, omm, ray)
+            cam_rot = self.sim.mj_data.cam_xmat[cam_id].reshape(3, 3)
+            world = acc @ cam_rot.T
+            out[e] = world @ head_rot                    # world -> head frame (R^T v, row-wise)
+        return out / np.linalg.norm(out, axis=-1, keepdims=True)
 
     # -- acting ---------------------------------------------------------------------------------
     def step(self, command: np.ndarray, n_steps: int) -> None:
